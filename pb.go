@@ -1,9 +1,9 @@
-package main
+package pb
 
 import(
 	"fmt"
 )
 
-func main() {
+func pb() {
 	fmt.Println("If this is deeply underground")
 }
