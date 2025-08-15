@@ -113,38 +113,40 @@ func (gs *GTIDSync) AnalyzeGTIDDifferences() error {
 		return fmt.Errorf("未找到主节点")
 	}
 
-	// 解析主节点的GTID集合
-	masterGTIDs, err := parseGTIDSet(masterInstance.GTIDSet)
-	if err != nil {
-		return err
-	}
-
-	// 创建一个映射，用于存储每个从节点的缺失GTID
-	allMissingGTIDs := make(map[string]map[string][]int)
-
-	// 分析每个从节点的GTID差异
+	// 解析所有节点的GTID集合
+	allGTIDs := make(map[string]map[string][]GTIDInterval)
 	for i := range gs.Instances {
 		instance := &gs.Instances[i]
-		if instance.IsMaster {
-			continue // 跳过主节点
-		}
-
-		// 解析从节点的GTID集合
-		slaveGTIDs, err := parseGTIDSet(instance.GTIDSet)
+		
+		// 解析节点的GTID集合
+		gtids, err := parseGTIDSet(instance.GTIDSet)
 		if err != nil {
 			return err
 		}
+		
+		allGTIDs[instance.Address] = gtids
+	}
 
-		// 计算差异
-		missingGTIDs := calculateMissingGTIDs(slaveGTIDs, masterGTIDs)
+	// 计算所有节点的GTID并集
+	unionGTIDs := calculateGTIDUnion(allGTIDs)
+
+	// 创建一个映射，用于存储每个节点缺失的GTID
+	allMissingGTIDs := make(map[string]map[string][]int)
+
+	// 分析每个节点的GTID差异
+	for i := range gs.Instances {
+		instance := &gs.Instances[i]
+		
+		// 计算当前节点与GTID并集的差异
+		missingGTIDs := calculateMissingGTIDs(allGTIDs[instance.Address], unionGTIDs)
 		if len(missingGTIDs) > 0 {
 			allMissingGTIDs[instance.Address] = missingGTIDs
 		}
 	}
 
-	// 生成单个SQL文件，包含所有从节点缺失的GTID
+	// 生成单个SQL文件，包含所有节点缺失的GTID
 	filename := fmt.Sprintf("gtid_sync_master_%s.sql", strings.Replace(masterInstance.Address, ":", "_", -1))
-	err = generateCombinedSQLFile(filename, allMissingGTIDs)
+	err := generateCombinedSQLFile(filename, allMissingGTIDs)
 	if err != nil {
 		return err
 	}
@@ -236,6 +238,34 @@ func parseInt(s string) (int, error) {
 		return 0, fmt.Errorf("无法解析整数 %s: %v", s, err)
 	}
 	return result, nil
+}
+
+// calculateGTIDUnion 计算所有节点的GTID并集
+func calculateGTIDUnion(allGTIDs map[string]map[string][]GTIDInterval) map[string][]GTIDInterval {
+	unionGTIDs := make(map[string][]GTIDInterval)
+
+	// 遍历所有节点
+	for _, nodeGTIDs := range allGTIDs {
+		// 遍历节点的所有UUID
+		for uuid, intervals := range nodeGTIDs {
+			// 如果并集中还没有此UUID，直接添加
+			if _, ok := unionGTIDs[uuid]; !ok {
+				unionGTIDs[uuid] = make([]GTIDInterval, len(intervals))
+				copy(unionGTIDs[uuid], intervals)
+				continue
+			}
+
+			// 将当前节点的区间添加到并集中
+			unionGTIDs[uuid] = append(unionGTIDs[uuid], intervals...)
+		}
+	}
+
+	// 合并每个UUID的重叠区间
+	for uuid, intervals := range unionGTIDs {
+		unionGTIDs[uuid] = mergeIntervals(intervals)
+	}
+
+	return unionGTIDs
 }
 
 // calculateMissingGTIDs 计算节点缺少的GTID，优化版本只比较区间
@@ -369,7 +399,7 @@ func maxInt(a, b int) int {
 	return b
 }
 
-// generateCombinedSQLFile 生成包含所有从节点缺失GTID的SQL文件
+// generateCombinedSQLFile 生成包含所有节点缺失GTID的SQL文件，用于在主节点执行
 func generateCombinedSQLFile(filename string, allMissingGTIDs map[string]map[string][]int) error {
 	file, err := os.Create(filename)
 	if err != nil {
@@ -379,23 +409,23 @@ func generateCombinedSQLFile(filename string, allMissingGTIDs map[string]map[str
 
 	// 写入文件头
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
-	_, err = file.WriteString(fmt.Sprintf("-- GTID同步SQL文件 (用于在主节点执行)\n-- 生成时间: %s\n\n", timestamp))
+	_, err = file.WriteString(fmt.Sprintf("-- GTID同步SQL文件 (用于在主节点执行)\n-- 生成时间: %s\n-- 注意: 此文件将在主节点上执行，并通过复制同步到所有从节点\n\n", timestamp))
 	if err != nil {
 		return fmt.Errorf("写入文件头失败: %v", err)
 	}
 
-	// 写入SET语句
-	_, err = file.WriteString("-- 禁用二进制日志，避免生成新的事务\nSET SESSION sql_log_bin = 0;\n\n")
+	// 写入SET语句 - 不关闭sql_log_bin，确保事务能复制到从节点
+	_, err = file.WriteString("-- 确保GTID_NEXT可以手动设置\nSET SESSION GTID_NEXT_AUTOMATIC_POSITION = 0;\n\n")
 	if err != nil {
 		return fmt.Errorf("写入SET语句失败: %v", err)
 	}
 
-	// 为每个从节点的缺失GTID生成GTID_NEXT语句
-	for slaveAddr, missingGTIDs := range allMissingGTIDs {
-		// 添加从节点标识的注释
-		_, err = file.WriteString(fmt.Sprintf("-- 以下是从节点 %s 缺失的GTIDs\n", slaveAddr))
+	// 为每个节点的缺失GTID生成GTID_NEXT语句
+	for nodeAddr, missingGTIDs := range allMissingGTIDs {
+		// 添加节点标识的注释
+		_, err = file.WriteString(fmt.Sprintf("-- 以下是节点 %s 缺失的GTIDs\n", nodeAddr))
 		if err != nil {
-			return fmt.Errorf("写入从节点注释失败: %v", err)
+			return fmt.Errorf("写入节点注释失败: %v", err)
 		}
 
 		// 为每个UUID的事务ID生成GTID_NEXT语句
@@ -462,7 +492,7 @@ func generateCombinedSQLFile(filename string, allMissingGTIDs map[string]map[str
 	}
 
 	// 写入恢复语句
-	_, err = file.WriteString("-- 恢复二进制日志和自动GTID分配\nSET SESSION sql_log_bin = 1;\nSET GTID_NEXT = 'AUTOMATIC';\n")
+	_, err = file.WriteString("-- 恢复自动GTID分配\nSET GTID_NEXT = 'AUTOMATIC';\n")
 	if err != nil {
 		return fmt.Errorf("写入恢复语句失败: %v", err)
 	}
@@ -519,5 +549,5 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Println("GTID同步完成，已生成SQL文件，请在主节点上执行该文件以注入空事务")
+	fmt.Println("GTID同步完成，已生成SQL文件，请在主节点上执行该文件以注入空事务，事务将通过复制同步到所有从节点")
 }
