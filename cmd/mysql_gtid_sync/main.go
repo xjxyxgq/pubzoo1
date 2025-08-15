@@ -238,7 +238,7 @@ func parseInt(s string) (int, error) {
 	return result, nil
 }
 
-// calculateMissingGTIDs 计算节点缺少的GTID
+// calculateMissingGTIDs 计算节点缺少的GTID，优化版本只比较区间
 func calculateMissingGTIDs(sourceGTIDs, targetGTIDs map[string][]GTIDInterval) map[string][]int {
 	missingGTIDs := make(map[string][]int)
 
@@ -247,9 +247,11 @@ func calculateMissingGTIDs(sourceGTIDs, targetGTIDs map[string][]GTIDInterval) m
 		// 检查源节点是否有此UUID的事务区间
 		sourceIntervals, ok := sourceGTIDs[uuid]
 		if !ok {
-			// 源节点完全缺少此UUID的所有事务
+			// 源节点完全缺少此UUID的所有事务，直接添加所有目标区间
 			missingGTIDs[uuid] = make([]int, 0)
 			for _, interval := range targetIntervals {
+				// 只记录区间的起止点，而不是每个事务ID
+				// 但由于后续处理需要单个事务ID，这里仍然展开区间
 				for txnID := interval.Start; txnID <= interval.End; txnID++ {
 					missingGTIDs[uuid] = append(missingGTIDs[uuid], txnID)
 				}
@@ -257,21 +259,21 @@ func calculateMissingGTIDs(sourceGTIDs, targetGTIDs map[string][]GTIDInterval) m
 			continue
 		}
 
-		// 创建源节点事务ID的映射，用于快速查找
-		sourceTxns := make(map[int]bool)
-		for _, interval := range sourceIntervals {
-			for txnID := interval.Start; txnID <= interval.End; txnID++ {
-				sourceTxns[txnID] = true
-			}
-		}
+		// 合并源节点的所有区间，创建一个有序的区间列表
+		mergedSourceIntervals := mergeIntervals(sourceIntervals)
 
-		// 检查源节点缺少的事务
-		for _, interval := range targetIntervals {
-			for txnID := interval.Start; txnID <= interval.End; txnID++ {
-				if !sourceTxns[txnID] {
-					if _, ok := missingGTIDs[uuid]; !ok {
-						missingGTIDs[uuid] = make([]int, 0)
-					}
+		// 对于每个目标区间，检查它是否被源区间覆盖
+		for _, targetInterval := range targetIntervals {
+			// 查找未被覆盖的区间
+			unCoveredRanges := findUncoveredRanges(targetInterval, mergedSourceIntervals)
+
+			// 将未覆盖的区间添加到缺失的GTID列表中
+			if _, ok := missingGTIDs[uuid]; !ok && len(unCoveredRanges) > 0 {
+				missingGTIDs[uuid] = make([]int, 0)
+			}
+
+			for _, uncoveredRange := range unCoveredRanges {
+				for txnID := uncoveredRange.Start; txnID <= uncoveredRange.End; txnID++ {
 					missingGTIDs[uuid] = append(missingGTIDs[uuid], txnID)
 				}
 			}
@@ -279,6 +281,92 @@ func calculateMissingGTIDs(sourceGTIDs, targetGTIDs map[string][]GTIDInterval) m
 	}
 
 	return missingGTIDs
+}
+
+// mergeIntervals 合并重叠的区间
+func mergeIntervals(intervals []GTIDInterval) []GTIDInterval {
+	if len(intervals) <= 1 {
+		return intervals
+	}
+
+	// 按照Start排序区间
+	sort.Slice(intervals, func(i, j int) bool {
+		return intervals[i].Start < intervals[j].Start
+	})
+
+	merged := []GTIDInterval{intervals[0]}
+	for i := 1; i < len(intervals); i++ {
+		current := intervals[i]
+		last := &merged[len(merged)-1]
+
+		// 如果当前区间的开始小于等于上一个区间的结束+1，则可以合并
+		if current.Start <= last.End+1 {
+			// 更新上一个区间的结束为两个区间结束的较大值
+			if current.End > last.End {
+				last.End = current.End
+			}
+		} else {
+			// 否则添加新区间
+			merged = append(merged, current)
+		}
+	}
+
+	return merged
+}
+
+// findUncoveredRanges 查找目标区间中未被源区间覆盖的部分
+func findUncoveredRanges(targetInterval GTIDInterval, sourceIntervals []GTIDInterval) []GTIDInterval {
+	uncovered := []GTIDInterval{}
+
+	// 如果源区间为空，则整个目标区间都未被覆盖
+	if len(sourceIntervals) == 0 {
+		return []GTIDInterval{targetInterval}
+	}
+
+	// 当前处理的起始位置
+	current := targetInterval.Start
+
+	// 遍历所有源区间
+	for _, sourceInterval := range sourceIntervals {
+		// 如果当前位置已经超过目标区间的结束，则退出循环
+		if current > targetInterval.End {
+			break
+		}
+
+		// 如果源区间的开始大于当前位置，且当前位置小于等于目标区间的结束
+		// 则当前位置到源区间开始-1的部分未被覆盖
+		if sourceInterval.Start > current && current <= targetInterval.End {
+			end := minInt(sourceInterval.Start-1, targetInterval.End)
+			uncovered = append(uncovered, GTIDInterval{Start: current, End: end})
+		}
+
+		// 更新当前位置为源区间结束+1和当前位置的较大值
+		current = maxInt(current, sourceInterval.End+1)
+	}
+
+	// 如果处理完所有源区间后，当前位置仍小于等于目标区间的结束
+	// 则当前位置到目标区间结束的部分未被覆盖
+	if current <= targetInterval.End {
+		uncovered = append(uncovered, GTIDInterval{Start: current, End: targetInterval.End})
+	}
+
+	return uncovered
+}
+
+// minInt 返回两个整数中的较小值
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// maxInt 返回两个整数中的较大值
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // generateCombinedSQLFile 生成包含所有从节点缺失GTID的SQL文件
