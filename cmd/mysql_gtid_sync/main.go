@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"flag"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -54,12 +56,17 @@ func NewGTIDSync(masterAddr string, slaveAddrs []string, user, password string) 
 func (gs *GTIDSync) ConnectAndFetchGTIDs() error {
 	for i := range gs.Instances {
 		instance := &gs.Instances[i]
-		dsn := fmt.Sprintf("%s:%s@tcp(%s)/mysql", instance.User, instance.Password, instance.Address)
+		dsn := fmt.Sprintf("%s:%s@tcp(%s)/mysql?timeout=5s", instance.User, instance.Password, instance.Address)
 		db, err := sql.Open("mysql", dsn)
 		if err != nil {
 			return fmt.Errorf("连接到 %s 失败: %v", instance.Address, err)
 		}
 		defer db.Close()
+		
+		// 设置连接池参数
+		db.SetConnMaxLifetime(5 * time.Second) // 设置连接最大生命周期
+		db.SetMaxOpenConns(10)                // 设置最大打开连接数
+		db.SetMaxIdleConns(5)                 // 设置最大空闲连接数
 
 		// 检查连接
 		err = db.Ping()
@@ -69,7 +76,11 @@ func (gs *GTIDSync) ConnectAndFetchGTIDs() error {
 
 		// 获取GTID集合
 		var gtidSet string
-		row := db.QueryRow("SHOW GLOBAL VARIABLES LIKE 'gtid_executed'")
+		// 创建一个带超时的上下文
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		
+		row := db.QueryRowContext(ctx, "SHOW GLOBAL VARIABLES LIKE 'gtid_executed'")
 		var name string
 		err = row.Scan(&name, &gtidSet)
 		if err != nil {
@@ -143,9 +154,15 @@ func (gs *GTIDSync) AnalyzeGTIDDifferences() error {
 	return nil
 }
 
-// parseGTIDSet 解析GTID集合字符串
-func parseGTIDSet(gtidSet string) (map[string]map[int]bool, error) {
-	result := make(map[string]map[int]bool)
+// GTIDInterval 表示一个GTID区间
+type GTIDInterval struct {
+	Start int
+	End   int
+}
+
+// parseGTIDSet 解析GTID集合字符串，优化版本只存储区间
+func parseGTIDSet(gtidSet string) (map[string][]GTIDInterval, error) {
+	result := make(map[string][]GTIDInterval)
 
 	// 如果GTID集合为空，直接返回空映射
 	if gtidSet == "" {
@@ -162,9 +179,9 @@ func parseGTIDSet(gtidSet string) (map[string]map[int]bool, error) {
 
 		uuid := parts[0]
 		
-		// 初始化UUID的事务ID映射
+		// 初始化UUID的事务区间列表
 		if _, ok := result[uuid]; !ok {
-			result[uuid] = make(map[int]bool)
+			result[uuid] = make([]GTIDInterval, 0)
 		}
 
 		// MySQL的GTID格式为 UUID:interval[:interval...]
@@ -194,16 +211,16 @@ func parseGTIDSet(gtidSet string) (map[string]map[int]bool, error) {
 					return nil, err
 				}
 
-				for i := start; i <= end; i++ {
-					result[uuid][i] = true
-				}
+				// 只存储区间的起止点，而不是每个事务ID
+				result[uuid] = append(result[uuid], GTIDInterval{Start: start, End: end})
 			} else {
 				// 处理单个事务ID
 				txnID, err := parseInt(r)
 				if err != nil {
 					return nil, err
 				}
-				result[uuid][txnID] = true
+				// 单个事务ID作为一个区间，起止点相同
+				result[uuid] = append(result[uuid], GTIDInterval{Start: txnID, End: txnID})
 			}
 		}
 	}
@@ -222,29 +239,41 @@ func parseInt(s string) (int, error) {
 }
 
 // calculateMissingGTIDs 计算节点缺少的GTID
-func calculateMissingGTIDs(sourceGTIDs, targetGTIDs map[string]map[int]bool) map[string][]int {
+func calculateMissingGTIDs(sourceGTIDs, targetGTIDs map[string][]GTIDInterval) map[string][]int {
 	missingGTIDs := make(map[string][]int)
 
 	// 遍历目标节点的所有UUID
-	for uuid, targetTxns := range targetGTIDs {
-		// 检查源节点是否有此UUID的事务
-		sourceTxns, ok := sourceGTIDs[uuid]
+	for uuid, targetIntervals := range targetGTIDs {
+		// 检查源节点是否有此UUID的事务区间
+		sourceIntervals, ok := sourceGTIDs[uuid]
 		if !ok {
 			// 源节点完全缺少此UUID的所有事务
-			missingGTIDs[uuid] = make([]int, 0, len(targetTxns))
-			for txnID := range targetTxns {
-				missingGTIDs[uuid] = append(missingGTIDs[uuid], txnID)
+			missingGTIDs[uuid] = make([]int, 0)
+			for _, interval := range targetIntervals {
+				for txnID := interval.Start; txnID <= interval.End; txnID++ {
+					missingGTIDs[uuid] = append(missingGTIDs[uuid], txnID)
+				}
 			}
 			continue
 		}
 
+		// 创建源节点事务ID的映射，用于快速查找
+		sourceTxns := make(map[int]bool)
+		for _, interval := range sourceIntervals {
+			for txnID := interval.Start; txnID <= interval.End; txnID++ {
+				sourceTxns[txnID] = true
+			}
+		}
+
 		// 检查源节点缺少的事务
-		for txnID := range targetTxns {
-			if !sourceTxns[txnID] {
-				if _, ok := missingGTIDs[uuid]; !ok {
-					missingGTIDs[uuid] = make([]int, 0)
+		for _, interval := range targetIntervals {
+			for txnID := interval.Start; txnID <= interval.End; txnID++ {
+				if !sourceTxns[txnID] {
+					if _, ok := missingGTIDs[uuid]; !ok {
+						missingGTIDs[uuid] = make([]int, 0)
+					}
+					missingGTIDs[uuid] = append(missingGTIDs[uuid], txnID)
 				}
-				missingGTIDs[uuid] = append(missingGTIDs[uuid], txnID)
 			}
 		}
 	}
@@ -288,11 +317,52 @@ func generateCombinedSQLFile(filename string, allMissingGTIDs map[string]map[str
 				return fmt.Errorf("写入UUID注释失败: %v", err)
 			}
 
-			for _, txnID := range txnIDs {
-				gtidNext := fmt.Sprintf("SET GTID_NEXT = '%s:%d';\nBEGIN;\nCOMMIT;\n\n", uuid, txnID)
-				_, err = file.WriteString(gtidNext)
-				if err != nil {
-					return fmt.Errorf("写入GTID_NEXT语句失败: %v", err)
+			// 对事务ID进行排序并合并为连续区间，减少SQL语句数量
+			if len(txnIDs) > 0 {
+				// 排序事务ID
+				sort.Ints(txnIDs)
+
+				// 合并连续的事务ID为区间
+				intervals := make([]GTIDInterval, 0)
+				start := txnIDs[0]
+				end := start
+
+				for i := 1; i < len(txnIDs); i++ {
+					if txnIDs[i] == end+1 {
+						// 连续的事务ID，扩展当前区间
+						end = txnIDs[i]
+					} else {
+						// 不连续，保存当前区间并开始新区间
+						intervals = append(intervals, GTIDInterval{Start: start, End: end})
+						start = txnIDs[i]
+						end = start
+					}
+				}
+				// 添加最后一个区间
+				intervals = append(intervals, GTIDInterval{Start: start, End: end})
+
+				// 为每个区间生成SQL语句
+				for _, interval := range intervals {
+					if interval.Start == interval.End {
+						// 单个事务ID
+						gtidNext := fmt.Sprintf("SET GTID_NEXT = '%s:%d';\nBEGIN;\nCOMMIT;\n\n", uuid, interval.Start)
+						_, err = file.WriteString(gtidNext)
+					} else {
+						// 事务ID区间，生成注释说明区间范围
+						_, err = file.WriteString(fmt.Sprintf("-- 事务ID区间: %d-%d\n", interval.Start, interval.End))
+						if err != nil {
+							return fmt.Errorf("写入区间注释失败: %v", err)
+						}
+
+						// 为区间中的每个事务ID生成SQL语句
+						for txnID := interval.Start; txnID <= interval.End; txnID++ {
+							gtidNext := fmt.Sprintf("SET GTID_NEXT = '%s:%d';\nBEGIN;\nCOMMIT;\n\n", uuid, txnID)
+							_, err = file.WriteString(gtidNext)
+							if err != nil {
+								return fmt.Errorf("写入GTID_NEXT语句失败: %v", err)
+							}
+						}
+					}
 				}
 			}
 		}
