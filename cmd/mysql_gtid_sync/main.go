@@ -15,11 +15,12 @@ import (
 
 // MySQLInstance 表示一个MySQL实例
 type MySQLInstance struct {
-	Address  string
-	User     string
-	Password string
-	GTIDSet  string
-	IsMaster bool
+	Address    string
+	User       string
+	Password   string
+	GTIDSet    string
+	ServerUUID string
+	IsMaster   bool
 }
 
 // GTIDSync 用于同步MySQL集群的GTID集合
@@ -52,7 +53,7 @@ func NewGTIDSync(masterAddr string, slaveAddrs []string, user, password string) 
 	return gs
 }
 
-// ConnectAndFetchGTIDs 连接到所有MySQL实例并获取它们的GTID集合
+// ConnectAndFetchGTIDs 连接到所有MySQL实例并获取它们的GTID集合和server_uuid
 func (gs *GTIDSync) ConnectAndFetchGTIDs() error {
 	for i := range gs.Instances {
 		instance := &gs.Instances[i]
@@ -74,13 +75,24 @@ func (gs *GTIDSync) ConnectAndFetchGTIDs() error {
 			return fmt.Errorf("Ping %s 失败: %v", instance.Address, err)
 		}
 
-		// 获取GTID集合
-		var gtidSet string
 		// 创建一个带超时的上下文
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		
-		row := db.QueryRowContext(ctx, "SHOW GLOBAL VARIABLES LIKE 'gtid_executed'")
+
+		// 获取server_uuid
+		var serverUUID string
+		row := db.QueryRowContext(ctx, "SHOW GLOBAL VARIABLES LIKE 'server_uuid'")
+		var uuidName string
+		err = row.Scan(&uuidName, &serverUUID)
+		if err != nil {
+			return fmt.Errorf("获取 %s 的server_uuid失败: %v", instance.Address, err)
+		}
+		instance.ServerUUID = serverUUID
+		fmt.Printf("实例 %s 的server_uuid: %s\n", instance.Address, serverUUID)
+
+		// 获取GTID集合
+		var gtidSet string
+		row = db.QueryRowContext(ctx, "SHOW GLOBAL VARIABLES LIKE 'gtid_executed'")
 		var name string
 		err = row.Scan(&name, &gtidSet)
 		if err != nil {
@@ -100,7 +112,7 @@ func (gs *GTIDSync) AnalyzeGTIDDifferences() error {
 		return fmt.Errorf("至少需要一个主节点和一个从节点")
 	}
 
-	// 获取主节点的GTID集合
+	// 获取主节点的GTID集合和ServerUUID
 	var masterInstance *MySQLInstance
 	for i := range gs.Instances {
 		if gs.Instances[i].IsMaster {
@@ -112,6 +124,8 @@ func (gs *GTIDSync) AnalyzeGTIDDifferences() error {
 	if masterInstance == nil {
 		return fmt.Errorf("未找到主节点")
 	}
+
+	fmt.Printf("主节点 %s 的server_uuid: %s\n", masterInstance.Address, masterInstance.ServerUUID)
 
 	// 解析所有节点的GTID集合
 	allGTIDs := make(map[string]map[string][]GTIDInterval)
@@ -137,8 +151,8 @@ func (gs *GTIDSync) AnalyzeGTIDDifferences() error {
 	for i := range gs.Instances {
 		instance := &gs.Instances[i]
 		
-		// 计算当前节点与GTID并集的差异
-		missingGTIDs := calculateMissingGTIDs(allGTIDs[instance.Address], unionGTIDs)
+		// 计算当前节点与GTID并集的差异，排除主节点的GTID
+		missingGTIDs := calculateMissingGTIDs(allGTIDs[instance.Address], unionGTIDs, masterInstance.ServerUUID)
 		if len(missingGTIDs) > 0 {
 			allMissingGTIDs[instance.Address] = missingGTIDs
 		}
@@ -268,12 +282,18 @@ func calculateGTIDUnion(allGTIDs map[string]map[string][]GTIDInterval) map[strin
 	return unionGTIDs
 }
 
-// calculateMissingGTIDs 计算节点缺少的GTID，优化版本只比较区间
-func calculateMissingGTIDs(sourceGTIDs, targetGTIDs map[string][]GTIDInterval) map[string][]int {
+// calculateMissingGTIDs 计算节点缺少的GTID，优化版本只比较区间，并排除主节点的GTID
+func calculateMissingGTIDs(sourceGTIDs, targetGTIDs map[string][]GTIDInterval, masterUUID string) map[string][]int {
 	missingGTIDs := make(map[string][]int)
 
 	// 遍历目标节点的所有UUID
 	for uuid, targetIntervals := range targetGTIDs {
+		// 如果UUID是主节点的UUID，则跳过，不生成主节点的GTID
+		if uuid == masterUUID {
+			fmt.Printf("跳过主节点UUID: %s 的GTID\n", uuid)
+			continue
+		}
+
 		// 检查源节点是否有此UUID的事务区间
 		sourceIntervals, ok := sourceGTIDs[uuid]
 		if !ok {
@@ -409,7 +429,7 @@ func generateCombinedSQLFile(filename string, allMissingGTIDs map[string]map[str
 
 	// 写入文件头
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
-	_, err = file.WriteString(fmt.Sprintf("-- GTID同步SQL文件 (用于在主节点执行)\n-- 生成时间: %s\n-- 注意: 此文件将在主节点上执行，并通过复制同步到所有从节点\n\n", timestamp))
+	_, err = file.WriteString(fmt.Sprintf("-- GTID同步SQL文件 (用于在主节点执行)\n-- 生成时间: %s\n-- 注意: 此文件将在主节点上执行，并通过复制同步到所有从节点\n-- 已排除主节点自身的GTID，只包含从节点缺失的GTID\n\n", timestamp))
 	if err != nil {
 		return fmt.Errorf("写入文件头失败: %v", err)
 	}
@@ -550,4 +570,5 @@ func main() {
 	}
 
 	fmt.Println("GTID同步完成，已生成SQL文件，请在主节点上执行该文件以注入空事务，事务将通过复制同步到所有从节点")
+	fmt.Println("注意: 已排除主节点自身的GTID，只包含从节点缺失的GTID")
 }
