@@ -6,10 +6,26 @@
     stress_ng_version: "0.17.08"
     stress_ng_rpm_file: "stress-ng-{{ stress_ng_version }}-1.el7.x86_64.rpm"
     stress_ng_source_file: "stress-ng-{{ stress_ng_version }}.tar.gz"
+    stress_ng_binary_file: "stress-ng"
     stress_ng_source_url: "https://github.com/ColinIanKing/stress-ng/archive/V{{ stress_ng_version }}.tar.gz"
     temp_dir: "/tmp/stress-ng-install"
 
   tasks:
+    # Pre-check: Check if stress-ng is already installed and working
+    - name: Check if stress-ng is already installed
+      command: stress-ng --version
+      register: existing_stress_ng
+      ignore_errors: yes
+
+    - name: Display existing installation message
+      debug:
+        msg: "stress-ng is already installed and working: {{ existing_stress_ng.stdout }}"
+      when: existing_stress_ng is succeeded
+
+    - name: Skip installation if stress-ng already exists
+      meta: end_host
+      when: existing_stress_ng is succeeded
+
     - name: Create temporary directory
       file:
         path: "{{ temp_dir }}"
@@ -109,6 +125,49 @@
       when: >
         compile_result is defined and compile_result is succeeded
 
+    - name: Check if stress-ng was installed via source compilation
+      command: which stress-ng
+      register: stress_ng_check_source
+      ignore_errors: yes
+      when: source_install_result is defined and source_install_result is succeeded
+
+    # Method 4: Copy pre-compiled binary if all other methods failed
+    - name: Copy pre-compiled stress-ng binary to target servers
+      copy:
+        src: "files/{{ stress_ng_binary_file }}"
+        dest: "{{ temp_dir }}/{{ stress_ng_binary_file }}"
+        mode: '0755'
+      when: >
+        (yum_install_result is failed or stress_ng_check_yum is failed) and
+        (rpm_install_result is failed or stress_ng_check_rpm is failed) and
+        (source_install_result is failed or stress_ng_check_source is failed)
+
+    - name: Test pre-compiled binary in /tmp
+      command: "{{ temp_dir }}/{{ stress_ng_binary_file }} --version"
+      register: binary_test_result
+      ignore_errors: yes
+      when: >
+        (yum_install_result is failed or stress_ng_check_yum is failed) and
+        (rpm_install_result is failed or stress_ng_check_rpm is failed) and
+        (source_install_result is failed or stress_ng_check_source is failed)
+
+    - name: Check if /usr/bin/stress-ng already exists
+      stat:
+        path: /usr/bin/stress-ng
+      register: usr_bin_stress_ng_exists
+      when: binary_test_result is defined and binary_test_result is succeeded
+
+    - name: Copy working binary to /usr/bin/stress-ng
+      copy:
+        src: "{{ temp_dir }}/{{ stress_ng_binary_file }}"
+        dest: /usr/bin/stress-ng
+        mode: '0755'
+        remote_src: yes
+      register: binary_install_result
+      when: >
+        binary_test_result is defined and binary_test_result is succeeded and
+        (usr_bin_stress_ng_exists.stat.exists is not defined or not usr_bin_stress_ng_exists.stat.exists)
+
     # Final verification
     - name: Verify stress-ng installation
       command: stress-ng --version
@@ -123,8 +182,10 @@
           ✓ stress-ng installed successfully via yum
           {% elif rpm_install_result is defined and rpm_install_result is succeeded and stress_ng_check_rpm is succeeded %}
           ✓ stress-ng installed successfully via RPM package
-          {% elif source_install_result is defined and source_install_result is succeeded and final_check is succeeded %}
+          {% elif source_install_result is defined and source_install_result is succeeded and stress_ng_check_source is succeeded %}
           ✓ stress-ng installed successfully from source
+          {% elif binary_install_result is defined and binary_install_result is succeeded and final_check is succeeded %}
+          ✓ stress-ng installed successfully from pre-compiled binary
           {% else %}
           ✗ stress-ng installation failed with all methods
           {% endif %}

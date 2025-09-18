@@ -4,9 +4,10 @@
 ```
 ├── install-stress-ng.yml    # 主playbook文件
 ├── inventory.ini           # 服务器清单文件
-├── files/                 # 存放RPM包和源码包的目录
+├── files/                 # 存放RPM包、源码包和二进制文件的目录
 │   ├── stress-ng-0.17.08-1.el7.x86_64.rpm  # RPM安装包
-│   └── stress-ng-0.17.08.tar.gz            # 源码包
+│   ├── stress-ng-0.17.08.tar.gz            # 源码包
+│   └── stress-ng                           # 预编译二进制文件
 └── README-ansible.md      # 使用说明
 ```
 
@@ -22,11 +23,18 @@ wget -O files/stress-ng-0.17.08-1.el7.x86_64.rpm \
   https://download-ib01.fedoraproject.org/pub/epel/7/x86_64/Packages/s/stress-ng-0.17.08-1.el7.x86_64.rpm
 ```
 
-**源码包** (最后备选)：
+**源码包** (第三备选)：
 ```bash
 # 下载源码包
 wget -O files/stress-ng-0.17.08.tar.gz \
   https://github.com/ColinIanKing/stress-ng/archive/V0.17.08.tar.gz
+```
+
+**预编译二进制文件** (最后备选)：
+```bash
+# 将已编译好的stress-ng二进制文件放入files目录
+cp /path/to/compiled/stress-ng files/stress-ng
+chmod +x files/stress-ng
 ```
 
 ### 2. 配置服务器清单
@@ -64,6 +72,11 @@ ansible-playbook -i inventory.ini install-stress-ng.yml --limit server1
 
 Playbook会按以下顺序尝试安装stress-ng：
 
+0. **前置检查: 检查已安装的stress-ng**
+   - 首先检查系统是否已经安装stress-ng
+   - 如果已安装且可用，跳过所有安装步骤
+   - 显示当前版本信息
+
 1. **方法1: YUM/DNF安装**
    - 尝试通过系统包管理器安装
    - 最简单快捷的方法
@@ -75,6 +88,11 @@ Playbook会按以下顺序尝试安装stress-ng：
 3. **方法3: 源码编译安装**
    - 如果RPM也失败，编译源码安装
    - 会自动安装编译依赖
+
+4. **方法4: 预编译二进制安装**
+   - 如果源码编译也失败，使用预编译的二进制文件
+   - 先在/tmp目录测试运行，成功后复制到/usr/bin/
+   - 安装前会检查/usr/bin/stress-ng是否已存在
 
 ## 验证安装
 
@@ -115,4 +133,5 @@ ansible-playbook -i inventory.ini install-stress-ng.yml -vvv
 - `stress_ng_version`: stress-ng版本号
 - `stress_ng_rpm_file`: RPM包文件名
 - `stress_ng_source_file`: 源码包文件名
+- `stress_ng_binary_file`: 预编译二进制文件名
 - `temp_dir`: 临时目录路径
