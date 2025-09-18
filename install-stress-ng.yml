@@ -1,0 +1,144 @@
+---
+- name: Install stress-ng with multiple fallback methods
+  hosts: all
+  become: yes
+  vars:
+    stress_ng_version: "0.17.08"
+    stress_ng_rpm_file: "stress-ng-{{ stress_ng_version }}-1.el7.x86_64.rpm"
+    stress_ng_source_file: "stress-ng-{{ stress_ng_version }}.tar.gz"
+    stress_ng_source_url: "https://github.com/ColinIanKing/stress-ng/archive/V{{ stress_ng_version }}.tar.gz"
+    temp_dir: "/tmp/stress-ng-install"
+
+  tasks:
+    - name: Create temporary directory
+      file:
+        path: "{{ temp_dir }}"
+        state: directory
+        mode: '0755'
+
+    # Method 1: Try installing via yum/dnf
+    - name: Try installing stress-ng via yum
+      package:
+        name: stress-ng
+        state: present
+      register: yum_install_result
+      ignore_errors: yes
+
+    - name: Check if stress-ng was installed via yum
+      command: which stress-ng
+      register: stress_ng_check_yum
+      ignore_errors: yes
+      when: yum_install_result is succeeded
+
+    # Method 2: Try installing via RPM package if yum failed
+    - name: Copy RPM package to target servers
+      copy:
+        src: "files/{{ stress_ng_rpm_file }}"
+        dest: "{{ temp_dir }}/{{ stress_ng_rpm_file }}"
+        mode: '0644'
+      when: yum_install_result is failed or stress_ng_check_yum is failed
+
+    - name: Install stress-ng via RPM package
+      package:
+        name: "{{ temp_dir }}/{{ stress_ng_rpm_file }}"
+        state: present
+      register: rpm_install_result
+      ignore_errors: yes
+      when: yum_install_result is failed or stress_ng_check_yum is failed
+
+    - name: Check if stress-ng was installed via RPM
+      command: which stress-ng
+      register: stress_ng_check_rpm
+      ignore_errors: yes
+      when: rpm_install_result is defined and rpm_install_result is succeeded
+
+    # Method 3: Compile from source if both yum and RPM failed
+    - name: Install development tools for compilation
+      package:
+        name:
+          - gcc
+          - make
+          - libaio-devel
+          - libattr-devel
+          - libbsd-devel
+          - libcap-devel
+          - libgcrypt-devel
+          - keyutils-libs-devel
+          - zlib-devel
+        state: present
+      ignore_errors: yes
+      when: >
+        (yum_install_result is failed or stress_ng_check_yum is failed) and
+        (rpm_install_result is failed or stress_ng_check_rpm is failed)
+
+    - name: Copy source package to target servers
+      copy:
+        src: "files/{{ stress_ng_source_file }}"
+        dest: "{{ temp_dir }}/{{ stress_ng_source_file }}"
+        mode: '0644'
+      when: >
+        (yum_install_result is failed or stress_ng_check_yum is failed) and
+        (rpm_install_result is failed or stress_ng_check_rpm is failed)
+
+    - name: Extract source package
+      unarchive:
+        src: "{{ temp_dir }}/{{ stress_ng_source_file }}"
+        dest: "{{ temp_dir }}"
+        remote_src: yes
+        creates: "{{ temp_dir }}/stress-ng-{{ stress_ng_version }}"
+      when: >
+        (yum_install_result is failed or stress_ng_check_yum is failed) and
+        (rpm_install_result is failed or stress_ng_check_rpm is failed)
+
+    - name: Compile stress-ng from source
+      make:
+        chdir: "{{ temp_dir }}/stress-ng-{{ stress_ng_version }}"
+        jobs: "{{ ansible_processor_vcpus }}"
+      register: compile_result
+      ignore_errors: yes
+      when: >
+        (yum_install_result is failed or stress_ng_check_yum is failed) and
+        (rpm_install_result is failed or stress_ng_check_rpm is failed)
+
+    - name: Install compiled stress-ng
+      make:
+        chdir: "{{ temp_dir }}/stress-ng-{{ stress_ng_version }}"
+        target: install
+      register: source_install_result
+      ignore_errors: yes
+      when: >
+        compile_result is defined and compile_result is succeeded
+
+    # Final verification
+    - name: Verify stress-ng installation
+      command: stress-ng --version
+      register: final_check
+      ignore_errors: yes
+
+    - name: Display installation result
+      debug:
+        msg: |
+          Installation Summary:
+          {% if yum_install_result is succeeded and stress_ng_check_yum is succeeded %}
+          ✓ stress-ng installed successfully via yum
+          {% elif rpm_install_result is defined and rpm_install_result is succeeded and stress_ng_check_rpm is succeeded %}
+          ✓ stress-ng installed successfully via RPM package
+          {% elif source_install_result is defined and source_install_result is succeeded and final_check is succeeded %}
+          ✓ stress-ng installed successfully from source
+          {% else %}
+          ✗ stress-ng installation failed with all methods
+          {% endif %}
+
+          Version: {{ final_check.stdout | default('Not available') }}
+
+    # Cleanup
+    - name: Clean up temporary files
+      file:
+        path: "{{ temp_dir }}"
+        state: absent
+      when: final_check is succeeded
+
+  handlers:
+    - name: restart services
+      debug:
+        msg: "stress-ng installation completed"
