@@ -107,9 +107,9 @@
         (rpm_install_result is failed or stress_ng_check_rpm is failed)
 
     - name: Compile stress-ng from source
-      make:
+      shell: make -j{{ (ansible_processor_vcpus / 2) | int | max(1) }}
+      args:
         chdir: "{{ temp_dir }}/stress-ng-{{ stress_ng_version }}"
-        jobs: "{{ ansible_processor_vcpus }}"
       register: compile_result
       ignore_errors: yes
       when: >
@@ -117,9 +117,9 @@
         (rpm_install_result is failed or stress_ng_check_rpm is failed)
 
     - name: Install compiled stress-ng
-      make:
+      shell: make install
+      args:
         chdir: "{{ temp_dir }}/stress-ng-{{ stress_ng_version }}"
-        target: install
       register: source_install_result
       ignore_errors: yes
       when: >

@@ -1,0 +1,118 @@
+---
+- name: 更新 supervisord orzdba.ini 配置文件中的硬盘块设备
+  hosts: all
+  become: yes
+  vars:
+    config_file: "/etc/supervisord.d/orzdba.ini"
+    mount_point: "/data"
+  
+  tasks:
+    - name: 检查 /data 目录是否存在
+      stat:
+        path: "{{ mount_point }}"
+      register: data_dir_stat
+      
+    - name: 如果 /data 目录不存在则失败
+      fail:
+        msg: "/data 目录不存在"
+      when: not data_dir_stat.stat.exists
+    
+    - name: 获取 /data 目录的挂载信息
+      shell: df -P {{ mount_point }} | tail -1 | awk '{print $1}'
+      register: mounted_device
+      changed_when: false
+      
+    - name: 显示当前挂载的设备
+      debug:
+        msg: "/data 挂载的设备是: {{ mounted_device.stdout }}"
+    
+    - name: 检查是否为 LVM 逻辑卷
+      shell: |
+        if [[ "{{ mounted_device.stdout }}" == *"/dev/mapper/"* ]] || [[ "{{ mounted_device.stdout }}" == *"/dev/"*"/"* ]]; then
+          # 获取 LVM 逻辑卷的物理卷信息
+          pvs --noheadings -o pv_name $(lvs --noheadings -o vg_name {{ mounted_device.stdout }} | tr -d ' ') 2>/dev/null | head -1 | tr -d ' '
+        else
+          # 如果不是 LVM，获取实际的块设备
+          lsblk -no PKNAME {{ mounted_device.stdout }} 2>/dev/null | head -1 || echo "{{ mounted_device.stdout }}"
+        fi
+      register: actual_device_result
+      changed_when: false
+      failed_when: actual_device_result.rc != 0
+      
+    - name: 设置实际的块设备变量
+      set_fact:
+        actual_device: "{{ actual_device_result.stdout | regex_replace('^/dev/', '') }}"
+      
+    - name: 显示实际的块设备
+      debug:
+        msg: "实际的块设备是: {{ actual_device }}"
+        
+    - name: 检查 supervisord 配置文件是否存在
+      stat:
+        path: "{{ config_file }}"
+      register: config_file_stat
+      
+    - name: 如果配置文件不存在则失败
+      fail:
+        msg: "配置文件 {{ config_file }} 不存在"
+      when: not config_file_stat.stat.exists
+    
+    - name: 备份原配置文件
+      copy:
+        src: "{{ config_file }}"
+        dest: "{{ config_file }}.backup.{{ ansible_date_time.epoch }}"
+        remote_src: yes
+        backup: yes
+      
+    - name: 读取当前配置文件内容
+      slurp:
+        src: "{{ config_file }}"
+      register: current_config
+      
+    - name: 显示当前配置文件中的 -d 参数
+      debug:
+        msg: "当前配置中的 -d 参数: {{ (current_config.content | b64decode) | regex_findall('-d\\s+\\S+') }}"
+    
+    - name: 更新配置文件中的 -d 参数
+      replace:
+        path: "{{ config_file }}"
+        regexp: '(-d\s+)\S+'
+        replace: '\1{{ actual_device }}'
+        backup: yes
+      register: config_updated
+      
+    - name: 验证配置文件是否被修改
+      debug:
+        msg: "配置文件已更新"
+      when: config_updated.changed
+      
+    - name: 显示更新后的配置文件中的 -d 参数
+      shell: grep -o '\-d\s\+\S\+' {{ config_file }} || true
+      register: updated_config_check
+      changed_when: false
+      when: config_updated.changed
+      
+    - name: 显示更新结果
+      debug:
+        msg: "更新后的 -d 参数: {{ updated_config_check.stdout }}"
+      when: config_updated.changed and updated_config_check.stdout != ""
+      
+    - name: 检查 supervisord 服务状态
+      systemd:
+        name: supervisord
+      register: supervisord_status
+      ignore_errors: yes
+      
+    - name: 重新加载 supervisord 配置
+      shell: supervisorctl reread && supervisorctl update
+      when: config_updated.changed and supervisord_status.status is defined and supervisord_status.status.ActiveState == "active"
+      ignore_errors: yes
+      
+    - name: 显示最终状态
+      debug:
+        msg: |
+          服务器: {{ inventory_hostname }}
+          挂载设备: {{ mounted_device.stdout }}
+          实际块设备: {{ actual_device }}
+          配置文件: {{ config_file }}
+          更新状态: {{ ' 已更新' if config_updated.changed else '无需更新' }}
