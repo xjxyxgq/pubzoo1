@@ -3,7 +3,10 @@ import sys
 import os
 import argparse
 import socket
-from typing import List, Tuple
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import List, Tuple, Dict
 
 try:
     import pymysql
@@ -156,6 +159,22 @@ def main():
         help="严格模式：出现任何错误即退出非零",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=max(4, (os.cpu_count() or 2) * 2),
+        help="并发线程数，默认为 2x CPU 核心数（不小于 4）",
+    )
+    parser.add_argument(
+        "--out-dir",
+        default=os.getenv("OUT_DIR", "."),
+        help="结果输出目录（按 vip 前缀命名文件）",
+    )
+    parser.add_argument(
+        "--file-suffix",
+        default=os.getenv("OUT_SUFFIX", "_bigtab.csv"),
+        help="结果文件名后缀，默认 _bigtab.csv",
+    )
+    parser.add_argument(
         "--input",
         default=None,
         help="包含 vip, ip 列表的文件路径；未提供则读取标准输入",
@@ -185,71 +204,145 @@ def main():
         eprint("[INFO] 未提供任何 vip, ip 输入；从标准输入按行提供，如: 'vip1, 10.0.0.1'")
         return 1
 
-    overall_ok = True
+    # 准备输出目录
+    out_dir = Path(args.out_dir)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as ex:
+        eprint(f"[ERROR] 无法创建输出目录 {out_dir}: {ex}")
+        return 11
 
-    for vip, ip in input_pairs:
-        # Basic validation for IP/hostname
-        try:
-            socket.gethostbyname(ip)
-        except Exception:
-            eprint(f"[WARN] 无法解析 IP/主机名: {ip}，将继续尝试连接")
+    # 每个 vip 一个锁，保证写文件时串行
+    vip_locks: Dict[str, threading.Lock] = {}
+    vip_locks_guard = threading.Lock()
 
-        try:
-            conn = connect_mysql(ip, args.port, args.user, args.password, args.timeout)
-        except Exception as ex:
-            overall_ok = False
-            eprint(f"[ERROR] 无法连接到 {ip}:{args.port} - {ex}")
-            if args.strict:
-                return 2
-            continue
+    def get_vip_lock(vip: str) -> threading.Lock:
+        if vip in vip_locks:
+            return vip_locks[vip]
+        with vip_locks_guard:
+            if vip not in vip_locks:
+                vip_locks[vip] = threading.Lock()
+            return vip_locks[vip]
 
+    def sanitize_filename(name: str) -> str:
+        safe = []
+        for ch in name:
+            if ch.isalnum() or ch in ('-', '_', '.'):
+                safe.append(ch)
+            else:
+                safe.append('_')
+        return ''.join(safe) or 'vip'
+
+    def output_path_for_vip(vip: str) -> Path:
+        return out_dir / f"{sanitize_filename(vip)}{args.file_suffix}"
+
+    def write_result_line(vip: str, line: str):
+        path = output_path_for_vip(vip)
+        lock = get_vip_lock(vip)
+        with lock:
+            with open(path, 'a', encoding='utf-8') as f:
+                f.write(line + "\n")
+
+    def progress(msg: str):
+        # 仅将进度输出到标准输出
+        print(msg)
+
+    def process_one(vip: str, ip: str) -> bool:
+        progress(f"[START] {vip}@{ip}: 开始处理")
         try:
             try:
-                dbname = find_target_database(conn, args.db_prefix)
+                socket.gethostbyname(ip)
+            except Exception:
+                progress(f"[WARN] {vip}@{ip}: 主机名无法解析，尝试直连")
+
+            try:
+                conn = connect_mysql(ip, args.port, args.user, args.password, args.timeout)
             except Exception as ex:
-                overall_ok = False
+                eprint(f"[ERROR] 无法连接到 {ip}:{args.port} - {ex}")
+                return False
+
+            try:
+                dbname = find_target_database(conn, args.db_prefix)
+                progress(f"[INFO] {vip}@{ip}: 目标库 {dbname}")
+            except Exception as ex:
                 eprint(f"[ERROR] {ip}: {ex}")
-                if args.strict:
-                    return 3
-                conn.close()
-                continue
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                return False
 
             try:
                 tables = list_tables_with_prefix(conn, dbname, args.table_prefix)
+                progress(f"[INFO] {vip}@{ip}: 匹配表数量 {len(tables)}")
             except Exception as ex:
-                overall_ok = False
                 eprint(f"[ERROR] {ip}: 无法列出表: {ex}")
-                if args.strict:
-                    return 4
-                conn.close()
-                continue
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                return False
 
             if not tables:
-                eprint(f"[INFO] {ip}: 数据库 {dbname} 中未找到前缀 {args.table_prefix} 的表")
-                conn.close()
-                continue
+                progress(f"[INFO] {vip}@{ip}: 未找到前缀 {args.table_prefix} 的表")
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                return True
 
-            for t in tables:
+            written = 0
+            total = len(tables)
+            for idx, t in enumerate(tables, 1):
                 try:
                     cnt = count_table_rows(conn, dbname, t, args.timeout)
                 except Exception as ex:
-                    overall_ok = False
                     eprint(f"[ERROR] {ip}: 统计 {dbname}.{t} 失败: {ex}")
                     if args.strict:
-                        conn.close()
-                        return 5
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        return False
                     continue
 
+                # 每张表的进度（不输出统计值到标准输出）
+                progress(f"[PROG] {vip}@{ip}: {idx}/{total} 统计 {t}")
+
                 if cnt >= args.threshold:
-                    # Output as: vip, ip, db_name, table_name, count
-                    print(f"{vip}, {ip}, {dbname}, {t}, {cnt}")
-        finally:
+                    line = f"{vip}, {ip}, {dbname}, {t}, {cnt}"
+                    write_result_line(vip, line)
+                    written += 1
+                    progress(f"[NOTE] {vip}@{ip}: {t} 超过阈值，已写入文件")
+
             try:
                 conn.close()
             except Exception:
                 pass
 
-    return 0 if overall_ok else 0  # Still exit 0 unless --strict
+            path = output_path_for_vip(vip)
+            if written > 0:
+                progress(f"[DONE] {vip}@{ip}: 完成，写入 {written} 条到 {path}")
+            else:
+                progress(f"[DONE] {vip}@{ip}: 完成，没有超过阈值的表")
+            return True
+        except Exception as ex:
+            eprint(f"[ERROR] {vip}@{ip}: 未处理异常 {ex}")
+            return False
+
+    overall_ok = True
+    # 并发执行
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futures = [pool.submit(process_one, vip, ip) for vip, ip in input_pairs]
+        for fut in as_completed(futures):
+            try:
+                ok = fut.result()
+            except Exception as ex:
+                eprint(f"[ERROR] 任务执行异常: {ex}")
+                ok = False
+            overall_ok = overall_ok and ok
+
+    return 0 if overall_ok or not args.strict else 1
 
 
 if __name__ == "__main__":
