@@ -55,32 +55,31 @@ def connect_mysql(host: str, port: int, user: str, password: str, timeout: int):
     )
 
 
-def find_target_database(conn, db_prefix: str) -> str:
+def find_database_by_regex(conn, db_regex: str) -> str:
     with conn.cursor() as cur:
-        # Use information_schema for portability
         sql = (
             "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA "
-            "WHERE SCHEMA_NAME LIKE %s ORDER BY SCHEMA_NAME"
+            "WHERE SCHEMA_NAME REGEXP %s ORDER BY SCHEMA_NAME"
         )
-        cur.execute(sql, (db_prefix + '%',))
+        cur.execute(sql, (db_regex,))
         rows = [r[0] for r in cur.fetchall()]
     if not rows:
-        raise RuntimeError(f"未找到前缀为 {db_prefix} 的数据库")
+        raise RuntimeError(f"未找到匹配正则 {db_regex} 的数据库")
     if len(rows) > 1:
         raise RuntimeError(
-            f"找到多个前缀为 {db_prefix} 的数据库: {', '.join(rows)}"
+            f"匹配正则 {db_regex} 的数据库不唯一: {', '.join(rows)}"
         )
     return rows[0]
 
 
-def list_tables_with_prefix(conn, db_name: str, table_prefix: str) -> List[str]:
+def list_tables_by_regex(conn, db_name: str, table_regex: str) -> List[str]:
     with conn.cursor() as cur:
         sql = (
             "SELECT TABLE_NAME FROM information_schema.TABLES "
-            "WHERE TABLE_SCHEMA=%s AND TABLE_NAME LIKE %s "
+            "WHERE TABLE_SCHEMA=%s AND TABLE_NAME REGEXP %s "
             "ORDER BY TABLE_NAME"
         )
-        cur.execute(sql, (db_name, table_prefix + '%'))
+        cur.execute(sql, (db_name, table_regex))
         return [r[0] for r in cur.fetchall()]
 
 
@@ -138,14 +137,14 @@ def main():
         help="超过该行数才输出，默认 3000000",
     )
     parser.add_argument(
-        "--db-prefix",
-        default=os.getenv("DB_PREFIX", "clearing_branch"),
-        help="数据库前缀，默认 clearing_branch",
+        "--db-regex",
+        default=os.getenv("DB_REGEX", r"^clearing_branch_[0-9]$"),
+        help="数据库名正则，默认 ^clearing_branch_[0-9]$",
     )
     parser.add_argument(
-        "--table-prefix",
-        default=os.getenv("TABLE_PREFIX", "t_p_trans"),
-        help="数据表前缀，默认 t_p_trans",
+        "--table-regex",
+        default=os.getenv("TABLE_REGEX", r"^t_p_trans_[0-9]{2}_[0-9]{2}$"),
+        help="表名正则，默认 ^t_p_trans_[0-9]{2}_[0-9]{2}$",
     )
     parser.add_argument(
         "--timeout",
@@ -262,7 +261,7 @@ def main():
                 return False
 
             try:
-                dbname = find_target_database(conn, args.db_prefix)
+                dbname = find_database_by_regex(conn, args.db_regex)
                 progress(f"[INFO] {vip}@{ip}: 目标库 {dbname}")
             except Exception as ex:
                 eprint(f"[ERROR] {ip}: {ex}")
@@ -273,7 +272,7 @@ def main():
                 return False
 
             try:
-                tables = list_tables_with_prefix(conn, dbname, args.table_prefix)
+                tables = list_tables_by_regex(conn, dbname, args.table_regex)
                 progress(f"[INFO] {vip}@{ip}: 匹配表数量 {len(tables)}")
             except Exception as ex:
                 eprint(f"[ERROR] {ip}: 无法列出表: {ex}")
@@ -284,7 +283,7 @@ def main():
                 return False
 
             if not tables:
-                progress(f"[INFO] {vip}@{ip}: 未找到前缀 {args.table_prefix} 的表")
+                progress(f"[INFO] {vip}@{ip}: 未找到匹配正则 {args.table_regex} 的表")
                 try:
                     conn.close()
                 except Exception:
